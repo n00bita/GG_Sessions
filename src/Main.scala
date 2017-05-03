@@ -1,0 +1,194 @@
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkContext._
+import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
+import java.sql.Timestamp
+import java.text.SimpleDateFormat
+import java.io._
+
+object Main {
+
+case class Session(gameID: Long, timestamp: Timestamp , event: String,userID : String )
+//case class Result(gameID: Long, startTime: Timestamp , stopTime: Timestamp, duration : Int,pauseTime : Int )
+
+
+implicit def ordered: Ordering[Timestamp] = new Ordering[Timestamp] {
+	def compare(x: Timestamp, y: Timestamp): Int = x compareTo y
+}
+
+
+
+    def writeList(fileName : String,data : List[Any]){
+        val pw = new PrintWriter(new FileOutputStream(new File(fileName ),true))
+        for(element <- data){
+        pw.append(element.toString()+"\n")
+        }
+        pw.close
+      }
+
+
+def diffInSeconds(T1 : java.sql.Timestamp,T2 :java.sql.Timestamp)={
+
+	((T1.getTime() - T2.getTime())/1000).toInt;
+}
+
+
+def validSessions(sessions : List[Session]){
+  var ggstart : Timestamp =new Timestamp(0.toLong)
+	var ggstop = new Timestamp(0.toLong)
+  var history : Session = new Session(0,new Timestamp(0L),"","")
+  var lastStop : Session = new Session(0,new Timestamp(0L),"","")
+  var sessionID = 0
+	//mutex Locks
+	var regGGStart = true
+	var regGGStop = false
+	//Lists
+	var write = scala.collection.mutable.ListBuffer[String]()
+	var startList=scala.collection.mutable.ListBuffer[Timestamp]()
+	var stopList=scala.collection.mutable.ListBuffer[Timestamp]()	
+	for(session <- sessions){
+	  //Has the record changed and calculate history
+	  if(session.userID != history.userID) {ggstop=new Timestamp(0L);ggstart=new Timestamp(0L);regGGStart=true;regGGStop = false}
+	  val break = if(session.userID != history.userID) 0 else diffInSeconds(session.timestamp,history.timestamp)
+	  history = session
+	if(session.event == "ggstart" && regGGStart == true) {
+	  ggstart = session.timestamp
+	  regGGStart = false
+	  regGGStop = true
+	  
+	  } else if(session.event == "ggstop" && regGGStop == true){
+	    ggstop = session.timestamp
+	    val break = if(lastStop.userID != session.userID) {sessionID = sessionID+1;0L} else {
+	      if(diffInSeconds(ggstart,lastStop.timestamp) >= 30) sessionID = sessionID+1;diffInSeconds(ggstart,lastStop.timestamp)}
+	    lastStop = session
+	    regGGStart = true
+	    regGGStop = false
+	    	if(diffInSeconds(ggstop,ggstart)>1){
+	    	  startList+=ggstart
+	        stopList+=ggstop
+	        write+=session.userID + "\t" + ggstart+"\t" + ggstop+"\t"+diffInSeconds(ggstop,ggstart)+"\t"+sessionID
+	    	}
+	//  println(session.gameID+"  "+session.userID+"  GGSTART :"+ggstart+" GGSTOP :"+ggstop)
+				}
+	}
+  	    
+	        writeList(s"${sessions.head.gameID}_sessions.txt",write.toList)
+  val startToEnd = startList zip stopList
+	val sessionDuration = startToEnd.map{case(x,y)=>diffInSeconds(y,x)}
+	val totalSession=sessionDuration.filter(_>1)
+	val validSession = totalSession.filter(_>=60)
+	val avgTime = if(validSession.size> 1) validSession.reduce(_+_)/validSession.size else if(!validSession.isEmpty) validSession.head else 0
+	println(sessions.head.gameID)
+	println(totalSession)
+	println("average time : "+avgTime/60+":"+avgTime%60+" total : "+totalSession.size+" valid : "+validSession.size)
+  
+	
+}
+
+
+
+def main(args: Array[String]) {
+	val conf = new SparkConf().setAppName("GeedyGames_Session").setMaster("local")
+	val sc = new SparkContext(conf)
+	val sqlContext = new SQLContext(sc) 
+	import sqlContext.implicits._
+	
+	val ggSessionRDD = sc.textFile("data")
+	.map(row => row.split(",")).map(fields => Session(fields(0).toLong,Timestamp.valueOf(fields(1)),fields(2),fields(3)))
+	
+	val listOfGames = ggSessionRDD.map(x => x.gameID).distinct().collect()
+	listOfGames.foreach {println}
+	val groupedRDD = ggSessionRDD.keyBy { x => x.gameID }.groupByKey()
+	//group again by user
+	val sortedRDD = groupedRDD.mapValues { iter => iter.toList.sortBy(_.timestamp)}
+	
+	
+//	val result = sortedRDD.map(x => 
+//	durationFinder(x._2)).collect()
+	
+	
+	//Per Game Divide to Files
+	for(gameID <- listOfGames){
+	  val filter_data = sortedRDD.filter(_._1 == gameID).flatMap(_._2)
+	  val groupByUserID = filter_data.keyBy { x => x.userID }.groupByKey()
+	  val sortByUserID = groupByUserID.mapValues { iter => iter.toList.sortBy(_.userID)}
+	  val write = sortByUserID.flatMap(_._2).collect
+	  validSessions(write.toList)
+	  writeList(s"$gameID.txt",write.toList)
+	  
+	}
+	val ggSchema = StructType(Array(
+          StructField("DEVICE_ID",StringType,true),
+          StructField("START_TIME",TimestampType,true),
+          StructField("END_TIME",TimestampType,true),
+          StructField("DURATION",IntegerType,true),
+          StructField("SESSION_ID",IntegerType,true)))
+
+	
+  val pw = new PrintWriter(new FileOutputStream(new File("result.txt"),true))
+  for(gameID <- listOfGames){        
+	val resultDF =sqlContext.read.option("delimiter", "\t").option("header", "false").schema(ggSchema).csv(gameID+"_sessions.txt")
+//	resultDF.show(false)
+	
+	resultDF.createOrReplaceTempView("GREEDYGAMES")
+	val greedyDF = sqlContext.sql("""SELECT SESSION_ID,DEVICE_ID,SUM(DURATION) AS DURATION,MIN(START_TIME),MAX(END_TIME) FROM GREEDYGAMES GROUP BY SESSION_ID,DEVICE_ID ORDER BY SESSION_ID""")
+  greedyDF.coalesce(1).write.csv(gameID+"_GREEDYGAMES.csv")
+	val valid = greedyDF.filter($"DURATION">=60)
+	val average =if(valid.head(1).isEmpty) 0 else valid.agg(avg($"DURATION")).first().getDouble(0)
+	val total = greedyDF.count()
+	val count = valid.count()
+	val mystr =s"gameId : $gameID total : $total valid : $count average : ${average.toInt/60}:${average.toInt%60}"
+	pw.append(mystr+"\n")
+  }
+	pw.close
+
+}
+}
+/*
+val ggSchema = StructType(Array(
+          StructField("GAME_ID",StringType,true),
+          StructField("DURATION",StringType,true),
+          StructField("TOTAL_SESSIONS",IntegerType,true),
+          StructField("VALID_SESSIONS",IntegerType,true)))
+	
+val resultDF = sqlContext.read.format("com.databricks.spark.csv").schema(ggSchema).load("aggregation.csv")
+resultDF.createOrReplaceTempView("GREEDYGAMES")
+val sqlDF = sqlContext.sql("SELECT * FROM GREEDYGAMES")
+sqlDF.show(false)
+
+sqlContext.sql("SELECT AVG(DURATION) FROM GREEDYGAMES").show(false)
+*/
+
+/*
+	 val df = sqlContext.read.json("ggevent.log")//.option("timestampFormat", "dd-MM-yyyy HH:mm:ss")
+	 val flatdf = df.select("bottle.game_id","bottle.timestamp","headers.ai5","headers.debug","headers.random","headers.sdkv","post.event","post.ts")
+  val filterDF = df.select("bottle.game_id","bottle.timestamp","post.event","headers.ai5")
+	  filterDF.write.csv("staging.csv")
+	  * 
+	  */
+	// val rows = flatdf.rdd.map { x => x.toString().split(",") }.map { field => Session(field(0).toLong,field(1),field(2))  }
+	// rows.take(2).foreach(println)
+	// val coll = rows.map(_.toString().split(",")).keyBy(x=>x(0)).groupByKey().mapValues(_.toList.sortBy(_.))
+
+/*
+   val ggSessionSchema = StructType(Array(
+      StructField("GAME_ID", LongType, true),
+      StructField("TIMESTAMP", TimestampType, true),
+      StructField("AI5", StringType, true),
+      StructField("DEBUG", IntegerType, true),
+      StructField("RANDOM", StringType, true),
+      StructField("SDKV", StringType, true),
+      StructField("EVENT", StringType, true),
+      StructField("TS", StringType, true)))
+ */
+
+/*  val ggSessionsDF= flatdf.withColumn("GAME_ID", $"game_id".cast(LongType))
+  .withColumn("TIMESTAMP", unix_timestamp($"timestamp","yyyy-MM-dd HH:mm:ss").cast(TimestampType))
+  .groupBy($"GAME_ID").sortBy
+ // ggSessionsDF.show(false)
+  df.printSchema()
+//  ggSessionsDF.printSchema()
+ *  
+ */
